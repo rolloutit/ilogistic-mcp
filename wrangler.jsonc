@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ilogistic-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  "vars": {
+    // Production: https://api.ilogistic.eu  |  Staging: https://devapi.ilogistic.eu
+    "ILOGISTIC_BASE_URL": "https://api.ilogistic.eu",
+    // Secure default: write/delete tools are NOT registered until this is "true".
+    "WRITES_ENABLED": "false",
+    // Comma separated browser origins allowed to call /mcp. Empty = reject any request carrying an Origin header.
+    "ALLOWED_ORIGINS": "",
+    // Try to refresh the iLogistic JWT once it is at least this old (the token lives 7 days = 168h).
+    "TOKEN_REFRESH_AFTER_HOURS": "144"
+  },
+
+  // Holds the refreshed iLogistic token. Wrangler auto-provisions it on first deploy.
+  "kv_namespaces": [{ "binding": "STATE" }],
+
+  // Workers Rate Limiting binding (free plan). period must be 10 or 60 seconds.
+  "ratelimits": [
+    { "name": "RL_AUTH_FAIL", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
+    { "name": "RL_KEY", "namespace_id": "1002", "simple": { "limit": 60, "period": 60 } },
+    { "name": "RL_WRITE", "namespace_id": "1003", "simple": { "limit": 20, "period": 60 } }
+  ],
+
+  // Token refresh attempts (cheap no-op unless the token is old enough).
+  "triggers": { "crons": ["17 */6 * * *"] }
+
+  // Secrets (never in this file):
+  //   wrangler secret put MCP_API_KEYS      # JSON array, see README / `npm run gen-key`
+  //   wrangler secret put ILOGISTIC_TOKEN   # initial iLogistic bearer token
+}
