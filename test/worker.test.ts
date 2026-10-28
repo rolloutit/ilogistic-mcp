@@ -12,6 +12,7 @@ const jwt = (iat: number) => `h.${btoa(JSON.stringify({ iat })).replace(/=+$/, "
 
 function makeEnv(over: Partial<Env> = {}, limiterOk = true): Env {
   const kv = new Map<string, string>();
+  const meta = new Map<string, unknown>();
   const limiter = { limit: vi.fn(async () => ({ success: limiterOk })) };
   return {
     MCP_API_KEYS: "[]",
@@ -20,7 +21,16 @@ function makeEnv(over: Partial<Env> = {}, limiterOk = true): Env {
     WRITES_ENABLED: "true",
     STATE: {
       get: async (k: string, t?: string) => (kv.has(k) ? (t === "json" ? JSON.parse(kv.get(k)!) : kv.get(k)) : null),
-      put: async (k: string, v: string) => void kv.set(k, v),
+      getWithMetadata: async (k: string) => ({ value: kv.get(k) ?? null, metadata: meta.get(k) ?? null }),
+      put: async (k: string, v: string, o?: { metadata?: unknown }) => {
+        kv.set(k, v);
+        if (o?.metadata) meta.set(k, o.metadata);
+      },
+      delete: async (k: string) => void kv.delete(k),
+      list: async ({ prefix }: { prefix: string }) => ({
+        keys: [...kv.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name, metadata: meta.get(name) })),
+        list_complete: true,
+      }),
     } as unknown as KVNamespace,
     RL_AUTH_FAIL: limiter,
     RL_KEY: limiter,
@@ -298,6 +308,113 @@ describe("token refresh robustness", () => {
     expect(lastEvt()).toBe("token_expiring");
     await run(now - 8 * 86400);
     expect(lastEvt()).toBe("token_expired");
+    vi.restoreAllMocks();
+  });
+});
+
+describe("per-request iLogistic tokens (multi-shop)", () => {
+  const ENC_KEY = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
+  const tenantEnv = async () => {
+    const env = await withKeys(makeEnv({ TOKEN_ENC_KEY: ENC_KEY, ILOGISTIC_TOKEN: undefined }));
+    return env;
+  };
+  const kvValues = (env: Env) => (env.STATE as unknown as { list: (o: object) => Promise<{ keys: { name: string }[] }> });
+  const sent = (i: number) => ((fetchMock.mock.calls[i]![1] as RequestInit).headers as Record<string, string>).Authorization;
+  const hdr = (token: string) => ({ "X-iLogistic-Token": token });
+  const now = () => Math.floor(Date.now() / 1000);
+
+  it("uses the shop's own token from the header, no server secret needed", async () => {
+    const env = await tenantEnv();
+    const shopA = jwt(now());
+    const shopB = jwt(now() - 100);
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(shopA));
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(shopB));
+    expect(sent(0)).toBe(`Bearer ${shopA}`);
+    expect(sent(1)).toBe(`Bearer ${shopB}`);
+  });
+
+  it("without the header and without a server secret the tool explains what is missing", async () => {
+    const res = (await (await rpc(await tenantEnv(), READ_KEY, call("ilogistic_list_products", {}))).json()) as any;
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toContain("X-iLogistic-Token");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed headers and a server without TOKEN_ENC_KEY", async () => {
+    const env = await tenantEnv();
+    expect((await rpc(env, READ_KEY, listTools, hdr("not a jwt"))).status).toBe(400);
+    const noKey = await withKeys(makeEnv({ TOKEN_ENC_KEY: undefined }));
+    expect((await rpc(noKey, READ_KEY, listTools, hdr(jwt(now())))).status).toBe(503);
+  });
+
+  it("stores tokens encrypted: nothing in KV contains the token", async () => {
+    const env = await tenantEnv();
+    const token = jwt(now());
+    const stored: string[] = [];
+    const put = env.STATE.put.bind(env.STATE);
+    env.STATE.put = (async (k: string, v: string, o?: object) => (stored.push(v), put(k, v, o as never))) as never;
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(token));
+    expect(stored.length).toBeGreaterThan(0);
+    for (const v of stored) expect(v).not.toContain(token);
+    expect((await kvValues(env).list({ prefix: "ten:" })).keys).toHaveLength(1);
+  });
+
+  it("refreshes on 401 and keeps using the refreshed token while the client still sends the original", async () => {
+    const env = await tenantEnv();
+    const original = jwt(now() - 3600);
+    const fresh = jwt(now() + 5);
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "Bad authentication token were provided" }), { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: fresh }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("[]", { status: 200 }))
+      .mockResolvedValueOnce(new Response("[]", { status: 200 }));
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(original));
+    expect(sent(0)).toBe(`Bearer ${original}`);
+    expect(String(fetchMock.mock.calls[1]![0])).toBe("https://upstream.test/authentication/auth");
+    expect(sent(1)).toBe(`Bearer ${original}`); // refresh is authenticated with the old token
+    expect(sent(2)).toBe(`Bearer ${fresh}`);
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(original)); // same client header, later
+    expect(sent(3)).toBe(`Bearer ${fresh}`);
+  });
+
+  it("an expired token that cannot be refreshed gives an actionable error", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const env = await tenantEnv();
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ error: "Bad authentication token were provided" }), { status: 401 }));
+    const res = (await (await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(jwt(now() - 20 * 86400)))).json()) as any;
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toContain("send it in the X-iLogistic-Token request header");
+    vi.restoreAllMocks();
+  });
+
+  it("is bound to the MCP key: the same iLogistic token under another key is a separate record", async () => {
+    const env = await tenantEnv();
+    const token = jwt(now());
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(token));
+    await rpc(env, ADMIN_KEY, call("ilogistic_list_products", {}), hdr(token));
+    expect((await kvValues(env).list({ prefix: "ten:" })).keys).toHaveLength(2);
+  });
+
+  it("cron refreshes due shop tokens and drops unrecoverable ones", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const env = await tenantEnv();
+    const due = jwt(now() - 150 * 3600); // older than the 144h threshold, still valid
+    const dead = jwt(now() - 9 * 86400);
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(due));
+    await rpc(env, ADMIN_KEY, call("ilogistic_list_products", {}), hdr(dead));
+    fetchMock.mockReset();
+    const fresh = jwt(now());
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ token: fresh }), { status: 200 }));
+    const pending: Promise<unknown>[] = [];
+    await worker.scheduled({} as ScheduledController, env, { waitUntil: (p: Promise<unknown>) => void pending.push(p) } as unknown as ExecutionContext);
+    await Promise.all(pending);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // only the due shop, one refresh call
+    expect(String(fetchMock.mock.calls[0]![0])).toBe("https://upstream.test/authentication/auth");
+    expect((await kvValues(env).list({ prefix: "ten:" })).keys).toHaveLength(1); // the dead one is gone
+    fetchMock.mockResolvedValue(new Response("[]", { status: 200 }));
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(due));
+    expect(sent(1)).toBe(`Bearer ${fresh}`);
     vi.restoreAllMocks();
   });
 });

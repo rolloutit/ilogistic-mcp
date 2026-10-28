@@ -1,11 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { authenticate, extractBearer } from "./auth";
-import { IlogisticClient } from "./ilogistic";
+import { authenticate, extractBearer, sha256Hex } from "./auth";
+import { IlogisticClient, maintainTenants, type Tenant } from "./ilogistic";
 import { registerTools } from "./tools";
 import type { Env } from "./types";
 
 const MAX_BODY_BYTES = 256 * 1024;
+// Header carrying the calling shop's own iLogistic JWT (3 base64url segments).
+const TOKEN_HEADER = "X-iLogistic-Token";
+const JWT_RE = /^[A-Za-z0-9_-]{1,2048}\.[A-Za-z0-9_-]{1,2048}\.[A-Za-z0-9_-]{0,2048}$/;
 
 const SECURITY_HEADERS = {
   "Cache-Control": "no-store",
@@ -83,6 +86,16 @@ export default {
     const rl = await env.RL_KEY.limit({ key: principal.name });
     if (!rl.success) return rpcError(429, "Rate limit exceeded", { "Retry-After": "60" });
 
+    // ---- the calling shop's iLogistic token (optional: falls back to the server-wide ILOGISTIC_TOKEN secret) ----
+    // The tenant id is bound to the MCP key too, so a leaked iLogistic token alone cannot reach the stored record.
+    let tenant: Tenant | undefined;
+    const shopToken = request.headers.get(TOKEN_HEADER);
+    if (shopToken !== null) {
+      if (!env.TOKEN_ENC_KEY) return rpcError(503, "Per-request iLogistic tokens are not enabled on this server");
+      if (!JWT_RE.test(shopToken)) return rpcError(400, `Invalid ${TOKEN_HEADER} header`);
+      tenant = { id: (await sha256Hex(`${principal.name}:${shopToken}`)).slice(0, 32), seed: shopToken };
+    }
+
     // ---- request validation ----
     if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) {
       return rpcError(415, "Content-Type must be application/json");
@@ -109,7 +122,7 @@ export default {
           "Customer names, phone numbers and street addresses are redacted and emails masked by the server (GDPR); do not try to recover them.",
       },
     );
-    registerTools({ server, client: new IlogisticClient(env), env, principal });
+    registerTools({ server, client: new IlogisticClient(env, tenant), env, principal });
 
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
@@ -124,6 +137,6 @@ export default {
   },
 
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(new IlogisticClient(env).scheduledMaintenance());
+    ctx.waitUntil(Promise.all([new IlogisticClient(env).scheduledMaintenance(), maintainTenants(env)]));
   },
 } satisfies ExportedHandler<Env>;

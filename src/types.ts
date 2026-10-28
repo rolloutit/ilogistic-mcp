@@ -1,7 +1,10 @@
 export interface Env {
   // secrets
   MCP_API_KEYS: string;
-  ILOGISTIC_TOKEN: string;
+  /** base64, 32 bytes. Enables per-request iLogistic tokens (X-iLogistic-Token): they are stored encrypted with this key. */
+  TOKEN_ENC_KEY?: string;
+  /** Optional single-shop fallback used when a request carries no X-iLogistic-Token header. */
+  ILOGISTIC_TOKEN?: string;
   // vars
   ILOGISTIC_BASE_URL: string;
   WRITES_ENABLED?: string;
