@@ -105,6 +105,51 @@ describe("authentication & request hygiene", () => {
     const res = await rpc(env, READ_KEY, { jsonrpc: "2.0", id: 1, method: "x", params: { pad: "a".repeat(300_000) } });
     expect(res.status).toBe(413);
   });
+
+  it("measures the body limit in bytes, not characters", async () => {
+    const env = await withKeys(makeEnv());
+    // 200k chars < 256 KiB, but 400k bytes in UTF-8
+    const res = await rpc(env, READ_KEY, { jsonrpc: "2.0", id: 1, method: "x", params: { pad: "é".repeat(200_000) } });
+    expect(res.status).toBe(413);
+  });
+});
+
+describe("PII redaction", () => {
+  const person = {
+    name: "Kovács Béla",
+    email: "bela.kovacs8@gmail.com",
+    phoneNumber: "+36701234567",
+    country: "HU",
+    postCode: "1234",
+    city: "Budapest",
+    address: "Petőfi Sándor u. 4.",
+  };
+  const order = {
+    id: 62,
+    foreignId: "I-1",
+    state: "Jóváhagyva",
+    delivery: { ...person, company: "GLS", aptNumber: null, taxNumber: "12345678" },
+    billing: person,
+    content: [{ productName: "Teszt Sajt", itemNumber: "SKU-1", quantity: 2 }],
+  };
+
+  for (const [tool, args, payload] of [
+    ["ilogistic_list_orders", {}, [order]],
+    ["ilogistic_get_order", { id: 62 }, order],
+  ] as const) {
+    it(`${tool} drops name/phone/address and masks email`, async () => {
+      const env = await withKeys(makeEnv());
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 200 }));
+      const res = (await (await rpc(env, READ_KEY, call(tool, args))).json()) as any;
+      const text: string = res.result.content[0].text;
+      for (const secret of ["Kovács", "+3670", "Petőfi", "bela.kovacs8", "12345678"]) expect(text).not.toContain(secret);
+      const out = JSON.parse(text);
+      const o = Array.isArray(out) ? out[0] : out;
+      expect(o.delivery).toEqual({ email: "b*****8@gmail.com", country: "HU", postCode: "1234", city: "Budapest", company: "GLS", aptNumber: null });
+      expect(o.billing).toEqual({ email: "b*****8@gmail.com", country: "HU", postCode: "1234", city: "Budapest" });
+      expect(o.content[0].productName).toBe("Teszt Sajt"); // non-customer names stay
+    });
+  }
 });
 
 describe("scope based tool exposure", () => {
@@ -205,5 +250,54 @@ describe("tool calls", () => {
     expect(res.result.isError).toBeFalsy();
     expect(String(fetchMock.mock.calls[1]![0])).toBe("https://upstream.test/authentication/auth");
     expect(((fetchMock.mock.calls[2]![1] as RequestInit).headers as Record<string, string>).Authorization).toBe(`Bearer ${fresh}`);
+  });
+});
+
+describe("token refresh robustness", () => {
+  const unauthorized = () => new Response(JSON.stringify({ error: "Bad authentication token were provided" }), { status: 401 });
+  const authCalls = () => fetchMock.mock.calls.filter(([u]) => String(u).endsWith("/authentication/auth")).length;
+
+  it("a dead token triggers at most one refresh attempt per backoff window", async () => {
+    const env = await withKeys(makeEnv());
+    fetchMock.mockImplementation(async () => unauthorized());
+    for (let i = 0; i < 3; i++) await rpc(env, READ_KEY, call("ilogistic_list_products", {}));
+    expect(authCalls()).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4); // 3 tool calls + 1 refresh, no retry storm
+  });
+
+  it("on 401 retries with a newer token another request already stored, without refreshing", async () => {
+    const env = await withKeys(makeEnv());
+    const newer = jwt(Math.floor(Date.now() / 1000) + 5);
+    fetchMock
+      .mockImplementationOnce(async () => {
+        await env.STATE.put("ilogistic:token", JSON.stringify({ token: newer, iat: Math.floor(Date.now() / 1000) + 5 }));
+        return unauthorized();
+      })
+      .mockResolvedValueOnce(new Response("[]", { status: 200 }));
+    const res = (await (await rpc(env, READ_KEY, call("ilogistic_list_products", {}))).json()) as any;
+    expect(res.result.isError).toBeFalsy();
+    expect(authCalls()).toBe(0);
+    expect(((fetchMock.mock.calls[1]![1] as RequestInit).headers as Record<string, string>).Authorization).toBe(`Bearer ${newer}`);
+  });
+
+  it("cron logs token_expiring under 24h and token_expired after expiry", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    fetchMock.mockImplementation(async () => unauthorized()); // refresh attempts fail
+    const now = Math.floor(Date.now() / 1000);
+    const run = async (iat: number) => {
+      const pending: Promise<unknown>[] = [];
+      await worker.scheduled({} as ScheduledController, makeEnv({ ILOGISTIC_TOKEN: jwt(iat) }), {
+        waitUntil: (p: Promise<unknown>) => void pending.push(p),
+      } as unknown as ExecutionContext);
+      await Promise.all(pending);
+    };
+    const lastEvt = () => JSON.parse(String(error.mock.calls.at(-1)![0])).evt;
+
+    await run(now - 7 * 86400 + 3600); // 1h left
+    expect(lastEvt()).toBe("token_expiring");
+    await run(now - 8 * 86400);
+    expect(lastEvt()).toBe("token_expired");
+    vi.restoreAllMocks();
   });
 });

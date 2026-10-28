@@ -5,6 +5,9 @@ const UPSTREAM_TIMEOUT_MS = 20_000;
 const KV_TOKEN = "ilogistic:token";
 const KV_BACKOFF = "ilogistic:refresh-backoff";
 const TOKEN_LIFETIME_S = 604_800; // 7 days, per the iLogistic docs
+// After a failed refresh (cron or 401 path) no new attempt for this long; short so a missed window is retried soon.
+const REFRESH_BACKOFF_S = 300;
+const EXPIRY_WARN_S = 24 * 3600;
 
 export class IlogisticError extends Error {
   constructor(
@@ -56,7 +59,9 @@ export class IlogisticClient {
   /**
    * Exchange the current token for a fresh one (GET /authentication/auth).
    * The API refuses tokens that are "too fresh", so this is only attempted when the token is old
-   * enough, and failures back off for an hour. Returns true when a new token was stored.
+   * enough (or `force`, on an upstream 401). Every failure, forced or not, backs off for
+   * REFRESH_BACKOFF_S, so a dead token cannot turn each tool call into extra upstream calls.
+   * Returns true when a new token was stored.
    */
   async refreshIfNeeded(force = false): Promise<boolean> {
     if (!this.env.ILOGISTIC_TOKEN) return false;
@@ -64,7 +69,7 @@ export class IlogisticClient {
     const ageS = Math.floor(Date.now() / 1000) - cur.iat;
     const thresholdS = Number(this.env.TOKEN_REFRESH_AFTER_HOURS ?? "144") * 3600;
     if (!force && cur.iat > 0 && ageS < thresholdS) return false;
-    if (!force && (await this.env.STATE.get(KV_BACKOFF))) return false;
+    if (await this.env.STATE.get(KV_BACKOFF)) return false;
 
     try {
       const res = await fetch(`${this.base}/authentication/auth`, {
@@ -73,16 +78,36 @@ export class IlogisticClient {
       });
       const data = (await res.json().catch(() => ({}))) as { token?: unknown; error?: unknown };
       if (res.ok && typeof data.token === "string") {
-        await this.env.STATE.put(KV_TOKEN, JSON.stringify({ token: data.token, iat: jwtIat(data.token) }));
-        console.log(JSON.stringify({ evt: "token_refreshed" }));
+        const iat = jwtIat(data.token);
+        // A concurrent refresh may already have stored a newer token: never replace it with an older one.
+        const latest = await this.currentToken();
+        if (iat >= latest.iat) await this.env.STATE.put(KV_TOKEN, JSON.stringify({ token: data.token, iat }));
+        console.log(JSON.stringify({ evt: "token_refreshed", forced: force }));
         return true;
       }
-      console.warn(JSON.stringify({ evt: "token_refresh_failed", status: res.status, error: String(data.error ?? "") }));
+      console.warn(
+        JSON.stringify({ evt: "token_refresh_failed", forced: force, status: res.status, error: String(data.error ?? "") }),
+      );
     } catch (e) {
-      console.warn(JSON.stringify({ evt: "token_refresh_error", error: (e as Error).message }));
+      console.warn(JSON.stringify({ evt: "token_refresh_error", forced: force, error: (e as Error).message }));
     }
-    await this.env.STATE.put(KV_BACKOFF, "1", { expirationTtl: 3600 });
+    await this.env.STATE.put(KV_BACKOFF, "1", { expirationTtl: REFRESH_BACKOFF_S });
     return false;
+  }
+
+  /** Cron entry point: refresh when due, then log the remaining lifetime (alert on token_expiring / token_expired). */
+  async scheduledMaintenance(): Promise<void> {
+    await this.refreshIfNeeded();
+    const ttl = await this.tokenTtl();
+    if (ttl === null) {
+      console.error(JSON.stringify({ evt: "token_unreadable", detail: "no iat in the iLogistic token" }));
+    } else if (ttl <= 0) {
+      console.error(JSON.stringify({ evt: "token_expired", secondsAgo: -ttl }));
+    } else if (ttl < EXPIRY_WARN_S) {
+      console.error(JSON.stringify({ evt: "token_expiring", hoursLeft: Math.round((ttl / 3600) * 10) / 10 }));
+    } else {
+      console.log(JSON.stringify({ evt: "token_status", hoursLeft: Math.round(ttl / 3600) }));
+    }
   }
 
   /** Seconds until the current token expires (negative = already expired). */
@@ -112,9 +137,13 @@ export class IlogisticClient {
       });
     };
 
-    let res = await send((await this.currentToken()).token);
-    if (res.status === 401 && (await this.refreshIfNeeded(true))) {
-      res = await send((await this.currentToken()).token);
+    const used = (await this.currentToken()).token;
+    let res = await send(used);
+    if (res.status === 401) {
+      // Another request may have refreshed meanwhile: try the newest stored token before refreshing ourselves.
+      const latest = (await this.currentToken()).token;
+      if (latest !== used) res = await send(latest);
+      else if (await this.refreshIfNeeded(true)) res = await send((await this.currentToken()).token);
     }
 
     const text = await res.text();

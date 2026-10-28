@@ -28,8 +28,8 @@
     { "name": "RL_WRITE", "namespace_id": "1003", "simple": { "limit": 20, "period": 60 } }
   ],
 
-  // Token refresh attempts (cheap no-op unless the token is old enough).
-  "triggers": { "crons": ["17 */6 * * *"] }
+  // Hourly: token refresh attempt (cheap no-op unless the token is old enough) + token_expiring / token_expired log.
+  "triggers": { "crons": ["17 * * * *"] }
 
   // Secrets (never in this file):
   //   wrangler secret put MCP_API_KEYS      # JSON array, see README / `npm run gen-key`

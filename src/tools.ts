@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { IlogisticClient, IlogisticError, toToolText } from "./ilogistic";
+import { redactPii } from "./pii";
 import {
   DELIVERY_COMPANIES,
   INWARD_STATES,
@@ -88,7 +89,11 @@ const inwardContents = z
 
 // ---------- tool plumbing ----------
 type Result = { content: { type: "text"; text: string }[]; isError?: boolean };
-const ok = (data: unknown): Result => ({ content: [{ type: "text", text: toToolText(data) }] });
+// every tool output goes through redactPii, so no read path can bypass it
+const ok = (data: unknown): Result => ({ content: [{ type: "text", text: toToolText(redactPii(data)) }] });
+
+const PII_NOTE =
+  " Customer PII is redacted (GDPR): delivery/billing name, phoneNumber and street address are removed, email is masked; only country, postCode, city, company and aptNumber remain.";
 const fail = (msg: string): Result => ({ content: [{ type: "text", text: msg }], isError: true });
 
 interface Ctx {
@@ -184,7 +189,7 @@ export function registerTools({ server, client, env, principal }: Ctx): void {
     "ilogistic_list_orders",
     "read",
     "List orders",
-    "List orders with optional filters and limit/offset pagination. Returns full order objects.",
+    "List orders with optional filters and limit/offset pagination." + PII_NOTE,
     {
       limit,
       offset,
@@ -206,7 +211,7 @@ export function registerTools({ server, client, env, principal }: Ctx): void {
     "ilogistic_get_order",
     "read",
     "Get order",
-    "Get one order by its iLogistic ID.",
+    "Get one order by its iLogistic ID." + PII_NOTE,
     { id },
     (a) => client.request("GET", `/orders/order/${a.id}`),
   );

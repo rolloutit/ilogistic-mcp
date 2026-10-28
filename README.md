@@ -2,7 +2,7 @@
 
 Remote MCP server (Streamable HTTP, stateless) az [iLogistic API](https://api.ilogistic.eu/documentation/) fölött: rendelések, termékek, bevételezés. Ingyenes Cloudflare Workers csomagon fut, Durable Object nélkül.
 
-> **Állapot:** a kód típusellenőrzött, 17 teszt fut rajta, és a Worker élesben fut, de **valódi iLogistic tokennel még nem lett kipróbálva** (nem volt még hozzáférés a platformhoz). A token-megújítás és a boolean szűrők (`0/1`) viselkedése az első valódi hívásig ellenőrizetlen.
+> **Állapot:** a kód típusellenőrzött, 23 teszt fut rajta, és a Worker élesben fut, de **valódi iLogistic tokennel még nem lett kipróbálva** (nem volt még hozzáférés a platformhoz). A token-megújítás és a boolean szűrők (`0/1`) viselkedése az első valódi hívásig ellenőrizetlen.
 
 ## Mi kell az iLogistic oldalról
 
@@ -10,7 +10,7 @@ Remote MCP server (Streamable HTTP, stateless) az [iLogistic API](https://api.il
 2. **Bearer token (JWT)** a fiókhoz. A token generálását a [hivatalos auth leírás](https://api.ilogistic.eu/documentation/authentication) részletezi. Ez kerül az `ILOGISTIC_TOKEN` secretbe.
 3. **Környezet:** éles `https://api.ilogistic.eu`, staging `https://devapi.ilogistic.eu` (sandbox regisztráció: <https://dev.ilogistic.eu>). A `wrangler.jsonc` `ILOGISTIC_BASE_URL` értéke dönti el, melyiket használja a Worker (alapérték: éles).
 4. **Termékek előre létezzenek.** Rendelés csak már felvett, aktív `itemNumber`-ekre adható le (a `ilogistic_create_product` is felvehet újat).
-5. **Token élettartam:** a JWT 7 napig érvényes, utána 120 mp-es ablakban lehet újat kérni (`GET /authentication/auth`). A Worker 6 óránként cronnal megpróbálja megújítani, ha a token legalább `TOKEN_REFRESH_AFTER_HOURS` (alapérték 144 = 6 nap) órás, az újat KV-ban tárolja, hiba esetén 1 órát vár, 401-re egyszer újrapróbál. Ha a token a leeway után is lejárt, az `ILOGISTIC_TOKEN` secretet kézzel kell cserélni. A `ilogistic_check_connection` tool megmutatja a hátralévő időt.
+5. **Token élettartam:** a JWT 7 napig érvényes, utána 120 mp-es ablakban lehet újat kérni (`GET /authentication/auth`). A Worker óránként cronnal megpróbálja megújítani, ha a token legalább `TOKEN_REFRESH_AFTER_HOURS` (alapérték 144 = 6 nap) órás, az újat KV-ban tárolja (régebbi tokennel sosem írja felül az újabbat). Upstream 401-re előbb a KV-ban lévő újabb tokennel próbálkozik, csak utána kér újat. Bármely sikertelen megújítás után 5 percig nem próbálkozik újra, így halott tokennél sincs hívásvihar. A cron minden futáskor logolja a token állapotát: `token_expiring` (24 óránál kevesebb van hátra), `token_expired`, `token_unreadable` error szinten, erre érdemes riasztást állítani a Cloudflare Workers Observability-ben. **Ellenőrizetlen:** a dokumentáció nem írja le, pontosan mikor ad az API új tokent. Ha csak a lejárat körüli rövid ablakban, az óránkénti cron kevés lehet. Ha a token a leeway után is lejárt, az `ILOGISTIC_TOKEN` secretet kézzel kell cserélni. A `ilogistic_check_connection` tool megmutatja a hátralévő időt.
 6. API limit: 100 kérés/mp.
 
 Az API OpenAPI specifikációi publikusak: `https://api.ilogistic.eu/documentation/config/{orders,products,bevetelezes,authentication}.yaml`. A fájlokat szerzői jogi okból nem tároljuk a repóban.
@@ -32,8 +32,9 @@ Az API OpenAPI specifikációi publikusak: `https://api.ilogistic.eu/documentati
 - **`WRITES_ENABLED=false` az alapértelmezés**: amíg nem kapcsolod be, egyetlen write/delete tool sincs regisztrálva. Éles webshopnál először csak olvasással próbálj.
 - **Rate limit** (Workers Rate Limiting binding): 10 sikertelen auth/perc/IP, 60 kérés/perc/kulcs, 20 írás/perc/kulcs.
 - **Origin ellenőrzés**: böngészős `Origin` csak az `ALLOWED_ORIGINS` listából; MCP kliensek nem küldenek Origin-t.
-- Csak `POST /mcp`, 256 KB body limit, `application/json` kötelező, szigorú zod validáció (pozitív egész ID-k, enum-ok, hossz-limitek), nincs szabad path/URL paraméter (nincs SSRF), upstream redirect nem követett (a token nem megy máshova).
+- Csak `POST /mcp`, 256 KiB body limit (bájtban mérve, chunked body-ra is), `application/json` kötelező, szigorú zod validáció (pozitív egész ID-k, enum-ok, hossz-limitek), nincs szabad path/URL paraméter (nincs SSRF), upstream redirect nem követett (a token nem megy máshova).
 - **iLogistic token** kizárólag secret/KV-ban, sosem kerül logba vagy tool-válaszba. Audit log: kulcs neve, tool, kimenet, idő; a tool argumentumokat (ügyfél PII) nem logoljuk.
+- **PII-szűrés (GDPR)**: minden tool-válasz átmegy a `src/pii.ts` szűrőn. A rendelések `delivery`/`billing` blokkjából a név, telefonszám és utcacím kikerül, az e-mail maszkolva (`b*****8@gmail.com`), csak ország, irányítószám, település, futárcég és csomagpont-azonosító marad. Allowlist alapú: az ismeretlen új mezők is kiesnek.
 - A tool válaszok max. 100 000 karakteresek; a szerver `instructions`-e jelzi, hogy a rendelés-mezők nem megbízható adatok (prompt injection ellen).
 
 ## Telepítés (Cloudflare)
