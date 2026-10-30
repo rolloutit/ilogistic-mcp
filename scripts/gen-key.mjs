@@ -1,8 +1,9 @@
 // Manages the MCP API keys. The list of key hashes lives in ./mcp-keys.local (gitignored, hashes only),
 // and `--push` uploads the complete list as the MCP_API_KEYS secret, so nobody has to rebuild the array by hand.
 //
-//   node scripts/gen-key.mjs <name> <scopes> [--push]   add a key (or replace the one with this name); scopes: read,write,delete
-//   node scripts/gen-key.mjs revoke <name> [--push]     remove a key
+//   node scripts/gen-key.mjs <name> <scopes> [--fallback] [--push]   add a key (or replace the one with this name); scopes: read,write,delete
+//        --fallback: the key may use the server-wide ILOGISTIC_TOKEN when it sends no X-iLogistic-Token (own shop only!)
+//   node scripts/gen-key.mjs revoke <name> [--push]     remove a key (its stored shop tokens are purged by the next hourly cron)
 //   node scripts/gen-key.mjs list                       show names and scopes
 //
 // The raw key is printed ONCE (give it to the client); only its SHA-256 hash is stored.
@@ -16,7 +17,8 @@ const sha = (s) => createHash("sha256").update(s).digest("hex");
 
 const args = process.argv.slice(2);
 const push = args.includes("--push");
-const [cmd = "", ...rest] = args.filter((a) => a !== "--push");
+const fallback = args.includes("--fallback");
+const [cmd = "", ...rest] = args.filter((a) => a !== "--push" && a !== "--fallback");
 
 function load() {
   if (existsSync(FILE)) return JSON.parse(readFileSync(FILE, "utf8"));
@@ -44,7 +46,7 @@ function save(keys) {
 const keys = load();
 
 if (cmd === "list") {
-  for (const k of keys) console.log(`${k.name}\t${k.scopes.join(",")}`);
+  for (const k of keys) console.log(`${k.name}\t${k.scopes.join(",")}${k.fallback ? "\tfallback" : ""}`);
 } else if (cmd === "revoke") {
   const [name] = rest;
   if (!keys.some((k) => k.name === name)) {
@@ -56,10 +58,10 @@ if (cmd === "list") {
   const [name = "", scopes = "read"] = [cmd, ...rest];
   const list = scopes.split(",").map((s) => s.trim());
   if (!name || !list.every((s) => SCOPES.includes(s))) {
-    console.error("usage: gen-key.mjs <name> <read|write|delete, comma separated> [--push] | revoke <name> [--push] | list");
+    console.error("usage: gen-key.mjs <name> <read|write|delete, comma separated> [--fallback] [--push] | revoke <name> [--push] | list");
     process.exit(1);
   }
   const key = "ilmcp_" + randomBytes(32).toString("base64url");
-  save([...keys.filter((k) => k.name !== name), { name, sha256: sha(key), scopes: list }]);
+  save([...keys.filter((k) => k.name !== name), { name, sha256: sha(key), scopes: list, ...(fallback ? { fallback: true } : {}) }]);
   console.log("\nAPI key for '" + name + "' (give it to the client; shown only now):\n  " + key);
 }

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { authenticate, extractBearer, sha256Hex } from "./auth";
-import { IlogisticClient, maintainTenants, type Tenant } from "./ilogistic";
+import { authenticate, extractBearer } from "./auth";
+import { IlogisticClient, jwtIat, maintainTenants, tenantId, type Tenant } from "./ilogistic";
 import { registerTools } from "./tools";
 import type { Env } from "./types";
 
@@ -86,14 +86,15 @@ export default {
     const rl = await env.RL_KEY.limit({ key: principal.name });
     if (!rl.success) return rpcError(429, "Rate limit exceeded", { "Retry-After": "60" });
 
-    // ---- the calling shop's iLogistic token (optional: falls back to the server-wide ILOGISTIC_TOKEN secret) ----
-    // The tenant id is bound to the MCP key too, so a leaked iLogistic token alone cannot reach the stored record.
+    // ---- the calling shop's iLogistic token (without it: the server-wide ILOGISTIC_TOKEN, for fallback keys only) ----
+    // The tenant id is bound to the MCP key's hash, so a leaked iLogistic token alone cannot reach the stored record,
+    // and a revoked key's records stay unreachable even if a new key is issued under the same name.
     let tenant: Tenant | undefined;
     const shopToken = request.headers.get(TOKEN_HEADER);
     if (shopToken !== null) {
       if (!env.TOKEN_ENC_KEY) return rpcError(503, "Per-request iLogistic tokens are not enabled on this server");
-      if (!JWT_RE.test(shopToken)) return rpcError(400, `Invalid ${TOKEN_HEADER} header`);
-      tenant = { id: (await sha256Hex(`${principal.name}:${shopToken}`)).slice(0, 32), seed: shopToken };
+      if (!JWT_RE.test(shopToken) || jwtIat(shopToken) <= 0) return rpcError(400, `Invalid ${TOKEN_HEADER} header`);
+      tenant = { id: await tenantId(principal.keyId, shopToken), seed: shopToken };
     }
 
     // ---- request validation ----
@@ -122,7 +123,7 @@ export default {
           "Customer names, phone numbers and street addresses are redacted and emails masked by the server (GDPR); do not try to recover them.",
       },
     );
-    registerTools({ server, client: new IlogisticClient(env, tenant), env, principal });
+    registerTools({ server, client: new IlogisticClient(env, tenant, principal.fallback), env, principal });
 
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

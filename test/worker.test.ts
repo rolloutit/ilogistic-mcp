@@ -1,14 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { sha256Hex } from "../src/auth";
+import { tenantId } from "../src/ilogistic";
 import type { Env } from "../src/types";
 
 const READ_KEY = "ilmcp_" + "r".repeat(43);
 const WRITE_KEY = "ilmcp_" + "w".repeat(43);
 const ADMIN_KEY = "ilmcp_" + "a".repeat(43);
+const NOFB_KEY = "ilmcp_" + "n".repeat(43); // no fallback flag
 
 // JWT whose payload is {"iat":1700000000}
-const jwt = (iat: number) => `h.${btoa(JSON.stringify({ iat })).replace(/=+$/, "")}.s`;
+const jwtWith = (payload: object) => `h.${btoa(JSON.stringify(payload)).replace(/=+$/, "")}.s`;
+const jwt = (iat: number) => jwtWith({ iat });
 
 function makeEnv(over: Partial<Env> = {}, limiterOk = true): Env {
   const kv = new Map<string, string>();
@@ -41,9 +44,10 @@ function makeEnv(over: Partial<Env> = {}, limiterOk = true): Env {
 
 async function withKeys(env: Env): Promise<Env> {
   env.MCP_API_KEYS = JSON.stringify([
-    { name: "reader", sha256: await sha256Hex(READ_KEY), scopes: ["read"] },
-    { name: "writer", sha256: await sha256Hex(WRITE_KEY), scopes: ["read", "write"] },
-    { name: "admin", sha256: await sha256Hex(ADMIN_KEY), scopes: ["read", "write", "delete"] },
+    { name: "reader", sha256: await sha256Hex(READ_KEY), scopes: ["read"], fallback: true },
+    { name: "writer", sha256: await sha256Hex(WRITE_KEY), scopes: ["read", "write"], fallback: true },
+    { name: "admin", sha256: await sha256Hex(ADMIN_KEY), scopes: ["read", "write", "delete"], fallback: true },
+    { name: "nofb", sha256: await sha256Hex(NOFB_KEY), scopes: ["read"] },
   ]);
   return env;
 }
@@ -384,6 +388,7 @@ describe("per-request iLogistic tokens (multi-shop)", () => {
     const res = (await (await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(jwt(now() - 20 * 86400)))).json()) as any;
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("send it in the X-iLogistic-Token request header");
+    expect(fetchMock).not.toHaveBeenCalled(); // an expired header token cannot start a chain
     vi.restoreAllMocks();
   });
 
@@ -415,6 +420,108 @@ describe("per-request iLogistic tokens (multi-shop)", () => {
     fetchMock.mockResolvedValue(new Response("[]", { status: 200 }));
     await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(due));
     expect(sent(1)).toBe(`Bearer ${fresh}`);
+    vi.restoreAllMocks();
+  });
+  const tenKeys = async (env: Env) => (await kvValues(env).list({ prefix: "ten:" })).keys.map((k) => k.name);
+  const runCron = async (env: Env) => {
+    const pending: Promise<unknown>[] = [];
+    await worker.scheduled({} as ScheduledController, env, { waitUntil: (p: Promise<unknown>) => void pending.push(p) } as unknown as ExecutionContext);
+    await Promise.all(pending);
+  };
+  const quiet = () => {
+    for (const m of ["log", "warn", "error"] as const) vi.spyOn(console, m).mockImplementation(() => {});
+  };
+
+  it("a key without the fallback flag never gets the server-wide ILOGISTIC_TOKEN", async () => {
+    const env = await withKeys(makeEnv()); // ILOGISTIC_TOKEN is set
+    const res = (await (await rpc(env, NOFB_KEY, call("ilogistic_list_products", {}))).json()) as any;
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toContain("X-iLogistic-Token");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects header tokens without iat", async () => {
+    expect((await rpc(await tenantEnv(), READ_KEY, listTools, hdr("aaaa.bm9pYXQ.x"))).status).toBe(400);
+  });
+
+  it("a token iLogistic rejects is never stored and costs no KV write", async () => {
+    quiet();
+    const env = await tenantEnv();
+    const puts: string[] = [];
+    const put = env.STATE.put.bind(env.STATE);
+    env.STATE.put = (async (k: string, v: string, o?: object) => (puts.push(k), put(k, v, o as never))) as never;
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ error: "Bad authentication token were provided" }), { status: 401 }));
+    const res = (await (await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(jwt(now())))).json()) as any;
+    expect(res.result.isError).toBe(true);
+    expect(puts).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
+  it(`retires a chain after TENANT_MAX_AGE_DAYS and the old header token cannot restart it`, async () => {
+    const env = await tenantEnv();
+    const token = jwt(now());
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(token));
+    expect(await tenKeys(env)).toHaveLength(1);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 31 * 86_400_000);
+      quiet();
+      fetchMock.mockClear();
+      const res = (await (await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(token))).json()) as any;
+      expect(res.result.isError).toBe(true);
+      expect(res.result.content[0].text).toContain("send it in the X-iLogistic-Token request header");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(await tenKeys(env)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("a new token of the same iLogistic user under the same key retires the old chain", async () => {
+    quiet();
+    const env = await tenantEnv();
+    const oldTok = jwtWith({ iat: now() - 3600, email: "Shop@Example.com" });
+    const newTok = jwtWith({ iat: now(), email: "shop@example.com" });
+    const otherShop = jwtWith({ iat: now(), email: "other@example.com" });
+    for (const [key, tok] of [[READ_KEY, oldTok], [READ_KEY, otherShop], [ADMIN_KEY, oldTok]] as const) {
+      await rpc(env, key, call("ilogistic_list_products", {}), hdr(tok));
+    }
+    expect(await tenKeys(env)).toHaveLength(3);
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(newTok));
+    const names = await tenKeys(env);
+    const id = async (key: string, tok: string) => `ten:${await tenantId(await sha256Hex(key), tok)}`;
+    expect(names).not.toContain(await id(READ_KEY, oldTok)); // retired
+    expect(names).toContain(await id(READ_KEY, newTok));
+    expect(names).toContain(await id(READ_KEY, otherShop)); // another shop: untouched
+    expect(names).toContain(await id(ADMIN_KEY, oldTok)); // another key: untouched
+    vi.restoreAllMocks();
+  });
+
+  it("cron purges the records of revoked keys", async () => {
+    quiet();
+    const env = await tenantEnv();
+    await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(jwt(now())));
+    await rpc(env, ADMIN_KEY, call("ilogistic_list_products", {}), hdr(jwt(now() - 5)));
+    env.MCP_API_KEYS = JSON.stringify(JSON.parse(env.MCP_API_KEYS).filter((k: { name: string }) => k.name !== "reader"));
+    await runCron(env);
+    const names = await tenKeys(env);
+    expect(names).toHaveLength(1);
+    expect(names[0]!.startsWith(`ten:${(await sha256Hex(ADMIN_KEY)).slice(0, 16)}.`)).toBe(true);
+    vi.restoreAllMocks();
+  });
+
+  it("cron refreshes the tokens closest to expiry first, within its KV budget", async () => {
+    quiet();
+    const env = await tenantEnv();
+    const tokens = Array.from({ length: 10 }, (_, i) => jwt(now() - (150 + i) * 3600)); // all due, tokens[9] oldest
+    for (const t of tokens) await rpc(env, READ_KEY, call("ilogistic_list_products", {}), hdr(t));
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ token: jwt(now()) }), { status: 200 }));
+    await runCron(env);
+    const refreshedWith = fetchMock.mock.calls.map((c) => ((c[1] as RequestInit).headers as Record<string, string>).Authorization);
+    expect(refreshedWith).toHaveLength(7); // (40 KV budget - 2 list calls) / 5 per refresh
+    expect(new Set(refreshedWith)).toEqual(new Set(tokens.slice(3).map((t) => `Bearer ${t}`)));
     vi.restoreAllMocks();
   });
 });

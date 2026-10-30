@@ -4,7 +4,7 @@ Remote MCP server (Streamable HTTP, stateless) az [iLogistic API](https://api.il
 
 **Több bolt, egy endpoint:** minden kliens a saját iLogistic tokenjét küldi az `X-iLogistic-Token` fejlécben, a Workerben nincs bolt-specifikus token. A Worker a megújított tokent boltonként, titkosítva tárolja, és maga frissíti, így a kliens fejlécét nem kell cserélgetni (lásd [Több bolt](#több-bolt-x-ilogistic-token)).
 
-> **Állapot:** a kód típusellenőrzött, 30 teszt fut rajta, és a Worker élesben fut, de **valódi iLogistic tokennel még nem lett kipróbálva** (nem volt még hozzáférés a platformhoz). A token-megújítás és a boolean szűrők (`0/1`) viselkedése az első valódi hívásig ellenőrizetlen.
+> **Állapot:** a kód típusellenőrzött, 38 teszt fut rajta, és a Worker élesben fut, de **valódi iLogistic tokennel még nem lett kipróbálva** (nem volt még hozzáférés a platformhoz). A token-megújítás és a boolean szűrők (`0/1`) viselkedése az első valódi hívásig ellenőrizetlen.
 
 ## Mi kell az iLogistic oldalról
 
@@ -118,12 +118,15 @@ Hitelesítés nélkül **nem** érdemes megnyitni: a szerver éles rendelési é
 
 Egy Worker, egy MCP endpoint, tetszőleges számú iLogistic bolt. Minden kliens a saját tokenjét küldi a fejlécben, a Workerben nincs bolt-specifikus beállítás.
 
-- **Első hívás:** a Worker titkosítva eltárolja a tokent (`ten:<azonosító>` KV kulcs), onnantól a tárolt, mindig legfrissebb tokent használja.
-- **Megújítás:** óránként a cron (és upstream 401-re a kérés is) lecseréli a tokent az iLogistic `GET /authentication/auth` hívásával, a megújított tokent a bolt rekordjába írja. **A kliens fejlécét nem kell cserélni**: a régi (már lejárt) tokenje ugyanarra a rekordra mutat. A megújítás a cronban kérésenként max. 8 boltot dolgoz fel (a free csomag 50 subrequest/futás limitje miatt), 144 és 168 óra között ez 190+ boltra elég.
-- **Lejárt, nem helyreállítható token** (a 120 mp-es leeway után): a rekord törlődik, és a kliensnek új tokent kell küldenie. A cron `tenant_token_expiring` / `tenant_token_expired` eseményt logol (csak a bolt azonosítójának első 8 karakterével).
-- **Takarítás:** 90 napja nem használt bolt rekordja magától törlődik, a cron nem frissíti tovább. Ha az ügyfél ennél tovább nem használja, új tokent kell kérnie az iLogisticből és beállítania az `X-iLogistic-Token` fejlécben; addig a tool-ok 401-gyel, érthető üzenettel válaszolnak ("The iLogistic token has expired or is invalid ... send it in the X-iLogistic-Token request header").
-- **Elszigetelés:** a bolt azonosítója az MCP kulcs nevéhez is kötött. Ha külön ügyfeleknek külön MCP kulcsot adsz (`npm run gen-key`), az egyiknek a kulcsa és tokenje sem éri el a másikét, és egy kulcs visszavonása (secret csere) az ügyfelet azonnal kizárja.
-- Hiányzó `TOKEN_ENC_KEY` esetén a fejléc használata 503, hibás formátum 400. Fejléc nélkül az (opcionális) `ILOGISTIC_TOKEN` secret az alapértelmezés, ha az sincs, a tool-ok érthető 503-at adnak.
+- **Első hívás:** a Worker csak akkor tárolja el a tokent (titkosítva, `ten:<azonosító>` KV kulcs), ha az iLogistic elfogadta (sikeres válasz vagy sikeres megújítás). Kitalált vagy lejárt token nem kerül KV-ba, és `iat` nélküli token már a fejlécnél 400-at kap. Onnantól a tárolt, mindig legfrissebb tokent használja.
+- **Megújítás:** óránként a cron (és upstream 401-re a kérés is) lecseréli a tokent az iLogistic `GET /authentication/auth` hívásával, a megújított tokent a bolt rekordjába írja. **A kliens fejlécét nem kell cserélni**, amíg a lánc él. A cron a lejárathoz legközelebbi tokeneket frissíti először, futásonként fix KV-kerettel (az ingyenes csomag 50 subrequest/futás limitje miatt); ami nem fér bele, a következő órában jön, `tenant_refresh_backlog` loggal.
+- **Maximális élettartam:** egy lánc az első tokentől számítva `TENANT_MAX_AGE_DAYS` napig (alapérték 30) él, utána törlődik, és a kliensnek friss iLogistic tokent kell küldenie. Így egy régi, kiszivárgott token sem ad korlátlan hozzáférést.
+- **Token csere = a régi visszavonása:** ha egy bolt ugyanazzal az MCP kulccsal új iLogistic tokent kezd küldeni (ugyanaz az iLogistic felhasználó, a token `email` claimje alapján), a Worker a régi lánco(ka)t törli. Kiszivárgott token esetén: kérj új tokent az iLogisticből, és tedd be a kliens fejlécébe. Ezért egy boltnál, egy MCP kulccsal minden kliensben ugyanazt a tokent használd (vagy kliensenként külön MCP kulcsot).
+- **Kulcs visszavonása:** a bolt azonosítója az MCP kulcs hash-éhez kötött (nem a nevéhez). `npm run gen-key -- revoke <név> --push` után a kulcs rekordjait a következő óránkénti cron törli, és egy azonos néven újra kiadott kulcs sem éri el őket.
+- **Lejárt, nem helyreállítható token** (a 120 mp-es leeway után): a rekord törlődik (`tenant_token_expired` log), a kliensnek új tokent kell küldenie. `tenant_token_expiring` jelzi, ha egy tokent 24 órán belül nem sikerült megújítani.
+- **Takarítás:** 90 napja nem használt bolt rekordja törlődik (a „utoljára használt” időpont külön KV kulcsban van, így a frissítése sosem írhatja felül a tokent).
+- **Tartalék token (`ILOGISTIC_TOKEN`):** fejléc nélkül csak az `--fallback` kapcsolóval létrehozott kulcsok használhatják (`npm run gen-key -- sajat read --fallback --push`). Ügyfélkulcsnak ezt ne add: az a tartalék bolt adataihoz férne hozzá.
+- Hiányzó `TOKEN_ENC_KEY` esetén a fejléc használata 503, hibás formátum 400. Fejléc nélkül, tartalék nélkül a tool-ok érthető 503-at adnak.
 
 ## Fejlesztés
 
