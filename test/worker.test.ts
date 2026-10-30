@@ -120,6 +120,17 @@ describe("authentication & request hygiene", () => {
     expect(res.status).toBe(413);
   });
 
+  it("refuses plain HTTP (except local dev) and sends HSTS", async () => {
+    const env = await withKeys(makeEnv());
+    for (const path of ["/mcp", "/health"]) {
+      const res = await worker.fetch(new Request(`http://w.test${path}`, { method: "POST", headers: { Authorization: `Bearer ${READ_KEY}` } }), env);
+      expect(res.status).toBe(403);
+    }
+    expect((await worker.fetch(new Request("http://localhost:8787/health"), env)).status).toBe(200);
+    const res = await rpc(env, READ_KEY, listTools);
+    expect(res.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
+  });
+
   it("measures the body limit in bytes, not characters", async () => {
     const env = await withKeys(makeEnv());
     // 200k chars < 256 KiB, but 400k bytes in UTF-8

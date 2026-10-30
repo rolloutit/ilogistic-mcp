@@ -4,7 +4,7 @@ Remote MCP server (Streamable HTTP, stateless) az [iLogistic API](https://api.il
 
 **Több bolt, egy endpoint:** minden kliens a saját iLogistic tokenjét küldi az `X-iLogistic-Token` fejlécben, a Workerben nincs bolt-specifikus token. A Worker a megújított tokent boltonként, titkosítva tárolja, és maga frissíti, így a kliens fejlécét nem kell cserélgetni (lásd [Több bolt](#több-bolt-x-ilogistic-token)).
 
-> **Állapot:** a kód típusellenőrzött, 38 teszt fut rajta, és a Worker élesben fut, de **valódi iLogistic tokennel még nem lett kipróbálva** (nem volt még hozzáférés a platformhoz). A token-megújítás és a boolean szűrők (`0/1`) viselkedése az első valódi hívásig ellenőrizetlen.
+> **Állapot:** a kód típusellenőrzött, 39 teszt fut rajta, és a Worker élesben fut, de **valódi iLogistic tokennel még nem lett kipróbálva** (nem volt még hozzáférés a platformhoz). A token-megújítás és a boolean szűrők (`0/1`) viselkedése az első valódi hívásig ellenőrizetlen.
 
 ## Mi kell az iLogistic oldalról
 
@@ -34,6 +34,7 @@ Az API OpenAPI specifikációi publikusak: `https://api.ilogistic.eu/documentati
 - **`WRITES_ENABLED=false` az alapértelmezés**: amíg nem kapcsolod be, egyetlen write/delete tool sincs regisztrálva. Éles webshopnál először csak olvasással próbálj.
 - **Rate limit** (Workers Rate Limiting binding): 10 sikertelen auth/perc/IP, 60 kérés/perc/kulcs, 20 írás/perc/kulcs.
 - **Origin ellenőrzés**: böngészős `Origin` csak az `ALLOWED_ORIGINS` listából; MCP kliensek nem küldenek Origin-t.
+- **Csak HTTPS**: titkosítatlan `http://` kérésre 403 (nincs átirányítás, hogy a rosszul beállított kliens ne küldje csendben, titkosítatlanul a kulcsot), `Strict-Transport-Security` fejléc; `wrangler dev` (localhost) kivétel.
 - Csak `POST /mcp`, 256 KiB body limit (bájtban mérve, chunked body-ra is), `application/json` kötelező, szigorú zod validáció (pozitív egész ID-k, enum-ok, hossz-limitek), nincs szabad path/URL paraméter (nincs SSRF), upstream redirect nem követett (a token nem megy máshova).
 - **iLogistic token** csak a kérés fejlécében érkezik, a KV-ban AES-256-GCM-mel titkosítva (`TOKEN_ENC_KEY`), sosem kerül logba vagy tool-válaszba. A bolt azonosítója `sha256(MCP kulcs neve + token)`, így egy kiszivárgott iLogistic token önmagában, MCP kulcs nélkül nem ér el semmit. Audit log: kulcs neve, tool, kimenet, idő; a tool argumentumokat (ügyfél PII) nem logoljuk.
 - **PII-szűrés (GDPR)**: minden tool-válasz átmegy a `src/pii.ts` szűrőn. A rendelések `delivery`/`billing` blokkjából a név, telefonszám és utcacím kikerül, az e-mail maszkolva (`b*****8@gmail.com`), csak ország, irányítószám, település, futárcég és csomagpont-azonosító marad. Allowlist alapú: az ismeretlen új mezők is kiesnek.

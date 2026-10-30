@@ -9,8 +9,10 @@ const MAX_BODY_BYTES = 256 * 1024;
 // Header carrying the calling shop's own iLogistic JWT (3 base64url segments).
 const TOKEN_HEADER = "X-iLogistic-Token";
 const JWT_RE = /^[A-Za-z0-9_-]{1,2048}\.[A-Za-z0-9_-]{1,2048}\.[A-Za-z0-9_-]{0,2048}$/;
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 const SECURITY_HEADERS = {
+  "Strict-Transport-Security": "max-age=31536000",
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff",
   "Content-Security-Policy": "default-src 'none'",
@@ -58,6 +60,12 @@ function clientIp(request: Request): string {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // workers.dev also answers plain HTTP. Refuse it (no redirect): a client configured with http:// must fail loudly
+    // instead of silently sending the MCP key and the iLogistic token in cleartext on every call. Local dev is exempt.
+    if (url.protocol !== "https:" && !LOCAL_HOSTS.has(url.hostname)) {
+      return json(403, { error: "https_required", message: "Use https://" });
+    }
 
     if (url.pathname === "/health") return json(200, { ok: true });
     if (url.pathname !== "/mcp") return json(404, { error: "not_found" });
